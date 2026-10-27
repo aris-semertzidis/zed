@@ -2108,6 +2108,33 @@ pub fn watch_user_agents_md(fs: Arc<dyn fs::Fs>, cx: &mut App) {
     });
 }
 
+/// Starts watching `%APPDATA%\Zed\SystemPrompt.md` (or the platform equivalent)
+/// and surfaces any read errors using the same notification UI as settings
+/// errors.
+///
+/// The file itself is loaded into [`agent::SystemPrompt`] and, when present,
+/// replaces the system prompt template embedded in Zed.
+pub fn watch_system_prompt(fs: Arc<dyn fs::Fs>, cx: &mut App) {
+    struct SystemPromptReadError;
+    let notification_id = NotificationId::unique::<SystemPromptReadError>();
+
+    agent::init_system_prompt(fs, cx, move |state, cx| match state {
+        agent::SystemPromptState::Loaded(_) | agent::SystemPromptState::Empty => {
+            dismiss_app_notification(&notification_id, cx);
+        }
+        agent::SystemPromptState::Error(message) => {
+            let path = paths::GLOBAL_SYSTEM_PROMPT_FILE_DISPLAY;
+            log::error!("Failed to load user SystemPrompt.md from {path}: {message}");
+            let body = format!("Failed to load {path}\n{message}");
+            let notification_id = notification_id.clone();
+            show_app_notification(notification_id, cx, move |cx| {
+                let body = body.clone();
+                cx.new(|cx| MessageNotification::new(body, cx))
+            });
+        }
+    });
+}
+
 pub fn watch_settings_files(fs: Arc<dyn fs::Fs>, cx: &mut App) {
     MigrationNotification::set_global(cx.new(|_| MigrationNotification), cx);
 

@@ -3,7 +3,7 @@ use crate::{
     CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool,
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
     GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
-    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
+    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool, SystemPrompt,
     SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
     WriteFileTool, decide_permission_from_settings,
 };
@@ -4630,10 +4630,32 @@ impl Thread {
             ),
             is_linux: cfg!(target_os = "linux"),
             is_windows: cfg!(target_os = "windows"),
-        }
-        .render(&self.templates)
-        .context("failed to build system prompt")
-        .expect("Invalid template");
+        };
+
+        let system_prompt = if let Some(custom_prompt) =
+            SystemPrompt::global(cx).and_then(|s| s.content().cloned())
+        {
+            match self
+                .templates
+                .render_custom_system_prompt(&custom_prompt, &system_prompt)
+            {
+                Ok(prompt) => prompt,
+                Err(error) => {
+                    log::error!(
+                        "Failed to render user SystemPrompt.md, falling back to the built-in prompt: {error:#}"
+                    );
+                    system_prompt
+                        .render(&self.templates)
+                        .context("failed to build system prompt")
+                        .expect("Invalid template")
+                }
+            }
+        } else {
+            system_prompt
+                .render(&self.templates)
+                .context("failed to build system prompt")
+                .expect("Invalid template")
+        };
         let mut messages = vec![LanguageModelRequestMessage {
             role: Role::System,
             content: vec![system_prompt.into()],

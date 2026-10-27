@@ -4,6 +4,7 @@ mod native_agent_server;
 pub mod outline;
 mod pattern_extraction;
 mod sandboxing;
+mod system_prompt;
 mod templates;
 #[cfg(test)]
 mod tests;
@@ -23,6 +24,7 @@ pub use sandboxing::{
     settings_thread_sandbox,
 };
 pub use shell_command_parser::extract_commands;
+pub use system_prompt::{SystemPrompt, SystemPromptState, init as init_system_prompt};
 pub use templates::*;
 pub use thread::*;
 pub use thread_store::*;

@@ -2,6 +2,7 @@ use anyhow::Result;
 use gpui::SharedString;
 use handlebars::Handlebars;
 use serde::Serialize;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 // Dev builds read the checkout's templates at runtime instead of embedding
@@ -13,6 +14,15 @@ util::fs_embed! {
     include = ["*.hbs"],
 }
 
+/// The built-in system prompt template.
+///
+/// Also used as the initial contents of the user-editable `SystemPrompt.md`
+/// file, so that the file starts out as an exact copy of the prompt Zed ships
+/// with.
+pub fn default_system_prompt_template() -> Cow<'static, str> {
+    util::asset_str::<Assets>("system_prompt.hbs")
+}
+
 pub struct Templates(Handlebars<'static>);
 
 impl Templates {
@@ -22,6 +32,16 @@ impl Templates {
         handlebars.register_helper("contains", Box::new(contains));
         handlebars.register_embed_templates::<Assets>().unwrap();
         Arc::new(Self(handlebars))
+    }
+
+    /// Renders a user-supplied system prompt template with the same data and
+    /// helpers as the built-in one.
+    pub fn render_custom_system_prompt(
+        &self,
+        template: &str,
+        data: &SystemPromptTemplate,
+    ) -> Result<String> {
+        Ok(self.0.render_template(template, data)?)
     }
 }
 

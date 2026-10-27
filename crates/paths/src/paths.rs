@@ -342,6 +342,25 @@ pub const GLOBAL_AGENTS_FILE_DISPLAY: &str =
 pub const GLOBAL_AGENTS_FILE_DISPLAY: &str =
     const_format::concatcp!("~/.config/", APP_NAME_LOWERCASE, "/AGENTS.md");
 
+/// Returns the path to the user-global `SystemPrompt.md` file.
+///
+/// When present and non-empty, this file replaces the system prompt template
+/// embedded in Zed, letting users customize the instructions given to the
+/// native agent without rebuilding the application. It is a Handlebars
+/// template and is rendered with the same context as the built-in prompt.
+pub fn system_prompt_file() -> &'static PathBuf {
+    static SYSTEM_PROMPT_FILE: OnceLock<PathBuf> = OnceLock::new();
+    SYSTEM_PROMPT_FILE.get_or_init(|| config_dir().join("SystemPrompt.md"))
+}
+
+/// User-facing display form of the user-global `SystemPrompt.md` file path.
+#[cfg(target_os = "windows")]
+pub const GLOBAL_SYSTEM_PROMPT_FILE_DISPLAY: &str =
+    const_format::concatcp!("%APPDATA%\\", APP_NAME, "\\SystemPrompt.md");
+#[cfg(not(target_os = "windows"))]
+pub const GLOBAL_SYSTEM_PROMPT_FILE_DISPLAY: &str =
+    const_format::concatcp!("~/.config/", APP_NAME_LOWERCASE, "/SystemPrompt.md");
+
 /// Returns the path to the extensions directory.
 ///
 /// This is where installed extensions are stored.
