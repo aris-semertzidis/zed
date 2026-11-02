@@ -26,6 +26,7 @@ set "TEMP=D:\Temp"
 REM ---- Build ----
 cd /d "%~dp0"
 set "LK_CUSTOM_WEBRTC=D:\Coding\zed-webrtc-release"
+set RELEASE_CHANNEL=stable
 cargo build --profile release-fast
 ::cargo build --profile release-fast -v 2>&1 | findstr /i "Dirty Fresh"
 
