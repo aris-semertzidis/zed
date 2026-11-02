@@ -6,7 +6,7 @@ use anyhow::{Context as _, Result};
 use client::{ErrorCode, ErrorExt};
 use collections::{BTreeSet, HashMap, hash_map};
 use editor::{
-    Editor, EditorEvent, MultiBufferOffset,
+    Editor, EditorElement, EditorEvent, EditorStyle, MultiBufferOffset,
     items::{
         entry_diagnostic_aware_icon_decoration_and_color,
         entry_diagnostic_aware_icon_name_and_color, entry_git_aware_label_color,
@@ -24,7 +24,7 @@ use gpui::{
     FileDropEvent, FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement, KeyContext,
     ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseExitEvent, ParentElement, PathPromptOptions, Pixels, Point,
-    PromptLevel, Render, ScrollStrategy, Stateful, Styled, Subscription, Task,
+    PromptLevel, Render, ScrollStrategy, Stateful, Styled, Subscription, Task, TextStyle,
     UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, div, hsla,
     linear_color_stop, linear_gradient, point, px, size, transparent_white, uniform_list,
 };
@@ -34,8 +34,8 @@ use markdown_preview::markdown_preview_view::MarkdownPreviewView;
 use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use notifications::status_toast::StatusToast;
 use project::{
-    Entry, EntryKind, Fs, GitEntry, GitEntryRef, GitTraversal, Project, ProjectEntryId,
-    ProjectPath, Worktree, WorktreeId,
+    Entry, EntryKind, Fs, GitEntry, GitEntryRef, GitTraversal, PathMatchCandidateSet, Project,
+    ProjectEntryId, ProjectPath, Worktree, WorktreeId,
     git_store::{GitStoreEvent, RepositoryEvent, git_traversal::ChildEntriesGitIter},
     project_settings::GoToDiagnosticSeverityFilter,
 };
@@ -55,15 +55,19 @@ use std::{
     collections::HashSet,
     ops::{Neg, Range},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use svg_preview::svg_preview_view::SvgPreviewView;
 use theme_settings::ThemeSettings;
 use ui::{
-    ContextMenu, DecoratedIcon, IconDecoration, IconDecorationKind, IndentGuideColors,
-    IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing, ProjectEmptyState,
-    ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
+    ContextMenu, DecoratedIcon, IconButtonShape, IconDecoration, IconDecorationKind,
+    IndentGuideColors, IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing,
+    ProjectEmptyState, ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip,
+    WithScrollbar, prelude::*,
 };
 use util::{
     ResultExt, TryFutureExt,
@@ -93,6 +97,9 @@ use crate::{
 
 const PROJECT_PANEL_KEY: &str = "ProjectPanel";
 const NEW_ENTRY_ID: ProjectEntryId = ProjectEntryId::MAX;
+/// Upper bound on the number of fuzzy file matches shown while filtering the
+/// project panel.
+const SEARCH_RESULT_LIMIT: usize = 500;
 
 struct VisibleEntriesForWorktree {
     worktree_id: WorktreeId,
@@ -151,6 +158,10 @@ pub struct ProjectPanel {
     selection: Option<SelectedEntry>,
     context_menu: Option<DeployedContextMenu>,
     filename_editor: Entity<Editor>,
+    search_editor: Entity<Editor>,
+    search_query: String,
+    search_task: Task<()>,
+    search_cancel_flag: Arc<AtomicBool>,
     clipboard: Option<ClipboardEntry>,
     _dragged_entry_destination: Option<Arc<Path>>,
     workspace: WeakEntity<Workspace>,
@@ -856,6 +867,26 @@ impl ProjectPanel {
             })
             .detach();
 
+            let search_editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text("Search files…", window, cx);
+                editor
+            });
+
+            cx.subscribe_in(
+                &search_editor,
+                window,
+                |project_panel, _, editor_event, window, cx| {
+                    if matches!(
+                        editor_event,
+                        EditorEvent::BufferEdited | EditorEvent::Edited { .. }
+                    ) {
+                        project_panel.update_search_query(window, cx);
+                    }
+                },
+            )
+            .detach();
+
             let mut project_panel_settings = *ProjectPanelSettings::get_global(cx);
             cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
                 let new_settings = *ProjectPanelSettings::get_global(cx);
@@ -899,6 +930,10 @@ impl ProjectPanel {
                 selection: None,
                 context_menu: None,
                 filename_editor,
+                search_editor,
+                search_query: String::new(),
+                search_task: Task::ready(()),
+                search_cancel_flag: Arc::new(AtomicBool::new(false)),
                 clipboard: None,
                 _dragged_entry_destination: None,
                 workspace: workspace.weak_handle(),
@@ -2411,6 +2446,10 @@ impl ProjectPanel {
     fn cancel(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
         if cx.stop_active_drag(window) {
             self.clear_drag_state(cx);
+            return;
+        }
+        if !self.search_query.trim().is_empty() {
+            self.clear_search(window, cx);
             return;
         }
         self.marked_entries.clear();
@@ -4602,6 +4641,255 @@ impl ProjectPanel {
         }
     }
 
+    /// Update the fuzzy search query from the search editor and either restore
+    /// the tree (empty query) or recompute the matching file list.
+    fn update_search_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.search_editor.read(cx).text(cx);
+        if query == self.search_query {
+            return;
+        }
+        self.search_query = query;
+
+        if self.search_query.trim().is_empty() {
+            self.search_cancel_flag.store(true, Ordering::Release);
+            self.search_task = Task::ready(());
+            self.update_visible_entries(None, false, false, window, cx);
+        } else {
+            self.search_files(window, cx);
+        }
+    }
+
+    /// Run the project's fuzzy path matcher over all visible worktrees and show
+    /// the matches as a flat list in the panel.
+    fn search_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.search_query.trim().to_owned();
+        if query.is_empty() {
+            self.update_visible_entries(None, false, false, window, cx);
+            return;
+        }
+
+        let settings = ProjectPanelSettings::get_global(cx);
+        let include_ignored = !settings.hide_gitignore;
+        let hide_hidden = settings.hide_hidden;
+
+        let worktrees = self
+            .project
+            .read(cx)
+            .visible_worktrees(cx)
+            .map(|worktree| {
+                let worktree = worktree.read(cx);
+                (worktree.id(), worktree.snapshot())
+            })
+            .collect::<Vec<_>>();
+
+        let candidate_sets = worktrees
+            .into_iter()
+            .map(|(_, snapshot)| PathMatchCandidateSet {
+                snapshot,
+                include_ignored,
+                include_root_name: false,
+                candidates: project::Candidates::Files,
+            })
+            .collect::<Vec<_>>();
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        self.search_cancel_flag.store(true, Ordering::Release);
+        self.search_cancel_flag = cancel_flag.clone();
+        let query_for_task = query;
+
+        self.search_task = cx.spawn_in(window, async move |this, cx| {
+            let relative_to: Option<Arc<RelPath>> = None;
+            let matches = fuzzy_nucleo::match_path_sets(
+                candidate_sets.as_slice(),
+                &query_for_task,
+                &relative_to,
+                fuzzy_nucleo::Case::Ignore,
+                SEARCH_RESULT_LIMIT,
+                &cancel_flag,
+                cx.background_executor().clone(),
+            )
+            .await;
+
+            if cancel_flag.load(Ordering::Acquire) {
+                return;
+            }
+
+            this.update_in(cx, |this, _window, cx| {
+                if this.search_query.trim() != query_for_task {
+                    return;
+                }
+                this.apply_search_results(matches, hide_hidden, cx);
+            })
+            .ok();
+        });
+    }
+
+    fn apply_search_results(
+        &mut self,
+        matches: Vec<fuzzy_nucleo::PathMatch>,
+        hide_hidden: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let worktrees = self
+            .project
+            .read(cx)
+            .visible_worktrees(cx)
+            .map(|worktree| {
+                let worktree = worktree.read(cx);
+                (worktree.id(), worktree.snapshot())
+            })
+            .collect::<Vec<_>>();
+
+        let mut new_state = State::derive(&self.state);
+        new_state.visible_entries.clear();
+        new_state.last_worktree_root_id = None;
+        new_state.max_width_item_index = None;
+
+        let mut max_width = 0;
+        let mut max_width_index = None;
+        let mut item_index = 0;
+
+        for path_match in matches {
+            if hide_hidden
+                && path_match
+                    .path
+                    .as_unix_str()
+                    .split('/')
+                    .any(|component| component.starts_with('.'))
+            {
+                continue;
+            }
+
+            let Some((worktree_id, snapshot)) = worktrees
+                .iter()
+                .find(|(worktree_id, _)| worktree_id.to_usize() == path_match.worktree_id)
+            else {
+                continue;
+            };
+            let Some(entry) = snapshot.entry_for_path(&path_match.path) else {
+                continue;
+            };
+
+            let width = item_width_estimate(
+                0,
+                path_match.path.as_unix_str().chars().count(),
+                entry.canonical_path.is_some(),
+            );
+            if width > max_width {
+                max_width = width;
+                max_width_index = Some(item_index);
+            }
+
+            new_state.visible_entries.push(VisibleEntriesForWorktree {
+                worktree_id: *worktree_id,
+                entries: vec![GitEntry {
+                    entry: entry.clone(),
+                    git_summary: GitSummary::UNCHANGED,
+                }],
+                index: OnceCell::new(),
+            });
+            item_index += 1;
+        }
+
+        new_state.max_width_item_index = max_width_index;
+
+        let first_selection = new_state
+            .visible_entries
+            .first()
+            .and_then(|visible| {
+                visible
+                    .entries
+                    .first()
+                    .map(|entry| (visible.worktree_id, entry.id))
+            })
+            .map(|(worktree_id, entry_id)| SelectedEntry {
+                worktree_id,
+                entry_id,
+            });
+
+        self.state = new_state;
+        self.selection = first_selection;
+        self.marked_entries.clear();
+        self.sticky_items_count = 0;
+        self.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// Clear the search editor and restore the normal project tree.
+    fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_query.clear();
+        self.search_cancel_flag.store(true, Ordering::Release);
+        self.search_task = Task::ready(());
+
+        self.search_editor.update(cx, |editor, cx| {
+            if !editor.text(cx).is_empty() {
+                editor.set_text("", window, cx);
+            }
+        });
+
+        self.update_visible_entries(None, false, false, window, cx);
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn render_search_bar(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme().colors();
+        let settings = ThemeSettings::get_global(cx);
+        let has_query = !self.search_query.trim().is_empty();
+
+        let text_style = TextStyle {
+            color: theme.text,
+            font_family: settings.ui_font.family.clone(),
+            font_features: settings.ui_font.features.clone(),
+            font_fallbacks: settings.ui_font.fallbacks.clone(),
+            font_size: rems(0.875).into(),
+            font_weight: settings.ui_font.weight,
+            line_height: relative(1.3),
+            ..TextStyle::default()
+        };
+        let editor_style = EditorStyle {
+            background: theme.panel_background,
+            local_player: cx.theme().players().local(),
+            text: text_style,
+            ..EditorStyle::default()
+        };
+
+        h_flex()
+            .id("project-panel-search-bar")
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_1p5()
+            .bg(theme.panel_background)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                Icon::new(IconName::MagnifyingGlass)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(EditorElement::new(&self.search_editor, editor_style)),
+            )
+            .when(has_query, |this| {
+                let panel = cx.entity();
+                this.child(
+                    IconButton::new("project-panel-clear-search", IconName::Close)
+                        .shape(IconButtonShape::Square)
+                        .tooltip(Tooltip::text("Clear Search"))
+                        .on_click(move |_, window, cx| {
+                            panel.update(cx, |this, cx| {
+                                this.clear_search(window, cx);
+                            });
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+
     fn update_visible_entries(
         &mut self,
         new_selected_entry: Option<(WorktreeId, ProjectEntryId)>,
@@ -4610,6 +4898,13 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // While a fuzzy query is active the panel shows a flat list of matching
+        // files instead of the tree. Keep those results in place rather than
+        // rebuilding the tree (and losing the user's selection) behind their back.
+        if !self.search_query.trim().is_empty() {
+            return;
+        }
+
         let now = Instant::now();
         let settings = ProjectPanelSettings::get_global(cx);
         let auto_collapse_dirs = settings.auto_fold_dirs;
@@ -4884,6 +5179,11 @@ impl ProjectPanel {
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {
+                // A search may have started while the tree was being built;
+                // its results must not be overwritten by this stale snapshot.
+                if !this.search_query.trim().is_empty() {
+                    return;
+                }
                 this.state = new_state;
                 if let Some((worktree_id, entry_id)) = new_selected_entry {
                     this.selection = Some(SelectedEntry {
@@ -7531,14 +7831,17 @@ impl Render for ProjectPanel {
             self.clear_drag_state(cx);
         }
 
-        let has_worktree = !self.state.visible_entries.is_empty();
+        let search_bar = self.render_search_bar(cx);
+        let is_searching = !self.search_query.trim().is_empty();
+        let has_worktree = !self.state.visible_entries.is_empty() || is_searching;
         let project = self.project.read(cx);
         let panel_settings = ProjectPanelSettings::get_global(cx);
         let indent_size = panel_settings.indent_size;
-        let show_indent_guides = panel_settings.indent_guides.show == ShowIndentGuides::Always;
+        let show_indent_guides =
+            panel_settings.indent_guides.show == ShowIndentGuides::Always && !is_searching;
         let horizontal_scroll = panel_settings.scrollbar.horizontal_scroll;
         let show_sticky_entries = {
-            if panel_settings.sticky_scroll {
+            if panel_settings.sticky_scroll && !is_searching {
                 let is_scrollable = self.scroll_handle.is_scrollable();
                 let is_scrolled = self.scroll_handle.offset().y < px(0.);
                 is_scrollable && is_scrolled
@@ -7728,6 +8031,7 @@ impl Render for ProjectPanel {
                 .track_focus(&self.focus_handle(cx))
                 .child(
                     v_flex()
+                        .child(search_bar)
                         .child(
                             uniform_list("entries", item_count, {
                                 cx.processor(|this, range: Range<usize>, window, cx| {
@@ -7968,6 +8272,13 @@ impl Render for ProjectPanel {
                                     cx,
                                 )
                                 .flex_grow_1()
+                                .when(is_searching && item_count == 0, |this| {
+                                    this.flex().items_center().justify_center().child(
+                                        Label::new("No matching files")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                })
                                 .on_scroll({
                                     let scroll_handle = self.scroll_handle.clone();
                                     let entity_id = cx.entity().entity_id();

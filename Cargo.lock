@@ -13952,6 +13952,7 @@ dependencies = [
  "file_icons",
  "fs",
  "futures 0.3.34",
+ "fuzzy_nucleo",
  "git",
  "git_ui",
  "git_ui_core",
